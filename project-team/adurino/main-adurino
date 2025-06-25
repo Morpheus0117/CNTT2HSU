@@ -1,0 +1,240 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// WiFi
+const char* ssid = "HSU_Students";
+const char* password = "tontrongsukhacbiet";
+
+// Server
+const char* serverUrl = "http://10.106.42.25:3001/api/sensors";
+const char* statusUrl = "http://10.106.42.25:3001/api/device/1/status";
+const String deviceId = "DEVICE_001";
+
+// GPIO
+#define DHTPIN 27
+#define DHTTYPE DHT11
+#define SOIL_PIN 34
+#define LED_WARNING 16
+#define RELAY_PIN 17
+
+// DHT
+DHT dht(DHTPIN, DHTTYPE);
+
+// NTP Time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // GMT+7
+
+// Ngưỡng cảnh báo
+const float TEMP_THRESHOLD_HIGH = 35.0;
+const float TEMP_THRESHOLD_LOW = 15.0;
+const float HUMID_THRESHOLD_LOW = 40.0;
+const float SOIL_THRESHOLD_LOW = 30.0;
+
+// Biến toàn cục điều khiển
+String currentMode = "manual";
+String timerOn = "07:00";
+String timerOff = "19:00";
+int relayStateManual = 0;
+
+unsigned long relayStart = 0;
+bool relayWasOn = false;
+
+// Ngưỡng độ ẩm (giá trị analog)
+int moistureThreshold = 500; // Điều chỉnh theo cảm biến
+
+// Chế độ hoạt động
+enum Mode { MANUAL, AUTO };
+Mode currentModeEnum = AUTO;
+
+// Trạng thái relay
+bool relayState = false;
+
+// Hàm gửi log về backend
+void sendLog(String type, String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    String payload = "{\"type\":\"" + type + "\",\"message\":\"" + message + "\"}";
+    int httpResponseCode = http.POST(payload);
+    http.end();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_WARNING, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(LED_WARNING, LOW);
+  digitalWrite(RELAY_PIN, LOW);
+
+  dht.begin();
+
+  WiFi.begin(ssid, password);
+  Serial.print("🔌 Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ Connected to WiFi");
+
+  timeClient.begin();
+  configTime(7 * 3600, 0, "pool.ntp.org"); // Giờ VN: GMT+7
+  Serial.println("🕒 Waiting for NTP time...");
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n🕒 Time synchronized.");
+
+  sendLog("system", "Device started and connected to WiFi");
+}
+
+void loop() {
+  // 1. Lấy mode, relayState (manual), timerSetting (schedule)
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(statusUrl);
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        currentMode = doc["data"]["mode"] | "manual";
+        relayStateManual = doc["data"]["relayState"] | 0;
+        timerOn = doc["data"]["timerSetting"]["on"] | "07:00";
+        timerOff = doc["data"]["timerSetting"]["off"] | "19:00";
+        Serial.println("🌐 Mode: " + currentMode + " | Timer: " + timerOn + " - " + timerOff);
+      }
+    }
+    http.end();
+  }
+
+  // 2. Đọc cảm biến
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  int soilRaw = analogRead(SOIL_PIN);
+  float soilMoisture = map(soilRaw, 4095, 0, 0, 100);
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("❌ Failed to read from DHT sensor!");
+    delay(2000);
+    return;
+  }
+
+  // 3. Điều khiển RELAY theo mode
+  if (currentMode == "manual") {
+    digitalWrite(RELAY_PIN, relayStateManual ? HIGH : LOW);
+  }
+  else if (currentMode == "automatic") {
+    bool needIrrigation = (
+      soilMoisture < SOIL_THRESHOLD_LOW &&
+      humidity < 60.0 &&
+      temperature > 26.0
+    );
+    if (needIrrigation && !relayWasOn) {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayStart = millis();
+      relayWasOn = true;
+      Serial.println("💡 Relay ON (Auto)");
+    }
+    if (relayWasOn && millis() - relayStart >= 10000) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayWasOn = false;
+      Serial.println("💤 Relay OFF (Auto 10s)");
+    }
+  }
+  else if (currentMode == "schedule") {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeStr[6];
+      sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      String currentTime = String(timeStr);
+
+      bool withinRange = currentTime >= timerOn && currentTime < timerOff;
+      digitalWrite(RELAY_PIN, withinRange ? HIGH : LOW);
+      Serial.println("🕒 Time: " + currentTime + " → Relay: " + (withinRange ? "ON" : "OFF"));
+    } else {
+      Serial.println("⚠️ Failed to get NTP time");
+    }
+  }
+
+  // 4. LED cảnh báo
+  bool warning = (
+    temperature > TEMP_THRESHOLD_HIGH ||
+    temperature < TEMP_THRESHOLD_LOW ||
+    humidity < HUMID_THRESHOLD_LOW ||
+    soilMoisture < SOIL_THRESHOLD_LOW
+  );
+  digitalWrite(LED_WARNING, warning ? HIGH : LOW);
+
+  // 5. Gửi dữ liệu cảm biến
+  if (WiFi.status() == WL_CONNECTED) {
+    String jsonString = "{\"device_id\"😕"" + deviceId + "\",\"humidity\":" + String(humidity, 1) +
+                        ",\"temperature\":" + String(temperature, 1) + "}";
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    int httpResponseCode = http.POST(jsonString);
+    if (httpResponseCode > 0) {
+      Serial.println("📤 Data sent");
+    } else {
+      Serial.println("❌ POST Failed: " + String(httpResponseCode));
+    }
+    http.end();
+  }
+
+  // In thông tin ra Serial
+  Serial.println("\n📊 Sensor Readings:");
+  Serial.println("🌡 Temp: " + String(temperature) + "°C");
+  Serial.println("💧 Humidity: " + String(humidity) + "%");
+  Serial.println("🌱 Soil Moisture: " + String(soilMoisture) + "%");
+
+  // Nhận lệnh từ Serial (bán tự động)
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "ON") {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayState = true;
+      sendLog("manual", "Relay turned ON by manual command");
+    } else if (command == "OFF") {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = false;
+      sendLog("manual", "Relay turned OFF by manual command");
+    } else if (command == "AUTO") {
+      currentModeEnum = AUTO;
+      sendLog("system", "Switched to AUTO mode");
+    } else if (command == "MANUAL") {
+      currentModeEnum = MANUAL;
+      sendLog("system", "Switched to MANUAL mode");
+    }
+  }
+
+  // Chế độ tự động
+  if (currentModeEnum == AUTO) {
+    if (soilMoisture < SOIL_THRESHOLD_LOW && !relayState) {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayState = true;
+      sendLog("auto", "Relay turned ON automatically (moisture low)");
+    } else if (soilMoisture >= SOIL_THRESHOLD_LOW && relayState) {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = false;
+      sendLog("auto", "Relay turned OFF automatically (moisture ok)");
+    }
+  }
+
+  // Gửi log cảm biến định kỳ
+  static unsigned long lastLogTime = 0;
+  if (millis() - lastLogTime > 60000) { // mỗi 60 giây
+    sendLog("sensor", "Moisture: " + String(soilMoisture));
+    lastLogTime = millis();
+  }
+
+  delay(1000);
+}
